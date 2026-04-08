@@ -8,8 +8,7 @@ import mediapipe as mp
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.append(current_dir)
-
-# Import the logic blocks
+# import the logic blocks
 try:
     from engine import HumanDetector
     from engine import AITrackingEngine, YogaAnalyzer
@@ -55,10 +54,18 @@ def main():
 
             if landmarks and mp_person_count >= 1:
                 current_pose = analyzer.detect_posture(landmarks)
-                color = (0, 0, 255) if "Slouching" in current_pose else (0, 255, 0)
-                cv2.putText(annotated_frame, f"Posture: {current_pose}", (20, 80), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                annotated_frame = analyzer.draw_landmarks_and_skeleton(annotated_frame, landmarks)
+                corrections, bad_joints = analyzer.get_corrections(landmarks, current_pose)
+
+                pose_color = (0, 0, 255) if "Slouching" in current_pose else (0, 255, 0)
+                cv2.putText(annotated_frame, f"Pose: {current_pose}", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, pose_color, 2)
+
+                for i, tip in enumerate(corrections):
+                    tip_color = (0, 200, 0) if "Great" in tip else (0, 100, 255)
+                    cv2.putText(annotated_frame, tip, (20, 120 + i * 32),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, tip_color, 2)
+
+                annotated_frame = analyzer.draw_landmarks_and_skeleton(annotated_frame, landmarks, bad_joints=bad_joints)
             else:
                 cv2.putText(annotated_frame, "Detecting pose...", (20, 80), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)

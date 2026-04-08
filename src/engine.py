@@ -74,24 +74,120 @@ class YogaAnalyzer:
         return landmarks[idx].visibility >= min_visibility
 
     @staticmethod
-    def draw_landmarks_and_skeleton(frame, landmarks, min_visibility=0.35):
+    def draw_landmarks_and_skeleton(frame, landmarks, min_visibility=0.35, bad_joints=None):
         h, w, _ = frame.shape
+        if bad_joints is None:
+            bad_joints = set()
 
         for i, j in YogaAnalyzer.POSE_CONNECTIONS:
             if not (YogaAnalyzer._is_visible(landmarks, i, min_visibility) and YogaAnalyzer._is_visible(landmarks, j, min_visibility)):
                 continue
             p1 = (int(landmarks[i].x * w), int(landmarks[i].y * h))
             p2 = (int(landmarks[j].x * w), int(landmarks[j].y * h))
-            cv_color = (255, 200, 0)
-            cv2.line(frame, p1, p2, cv_color, 2)
+            bone_color = (0, 80, 255) if (i in bad_joints or j in bad_joints) else (255, 200, 0)
+            cv2.line(frame, p1, p2, bone_color, 2)
 
         for idx, lm in enumerate(landmarks):
             if not YogaAnalyzer._is_visible(landmarks, idx, min_visibility):
                 continue
             x, y = int(lm.x * w), int(lm.y * h)
-            cv2.circle(frame, (x, y), 4, (0, 255, 255), -1)
+            dot_color = (0, 0, 255) if idx in bad_joints else (0, 255, 255)
+            cv2.circle(frame, (x, y), 5, dot_color, -1)
 
         return frame
+
+    @staticmethod
+    def get_corrections(landmarks, current_pose):
+        """Compares actual joint angles vs ideal ranges and returns correction tips + bad joint indices."""
+        corrections = []
+        bad_joints = set()
+
+        l_shldr = YogaAnalyzer._xy(landmarks, 11)
+        r_shldr = YogaAnalyzer._xy(landmarks, 12)
+        l_elbow = YogaAnalyzer._xy(landmarks, 13)
+        r_elbow = YogaAnalyzer._xy(landmarks, 14)
+        l_wrist = YogaAnalyzer._xy(landmarks, 15)
+        r_wrist = YogaAnalyzer._xy(landmarks, 16)
+        l_hip   = YogaAnalyzer._xy(landmarks, 23)
+        r_hip   = YogaAnalyzer._xy(landmarks, 24)
+        l_knee  = YogaAnalyzer._xy(landmarks, 25)
+        r_knee  = YogaAnalyzer._xy(landmarks, 26)
+        l_ankle = YogaAnalyzer._xy(landmarks, 27)
+        r_ankle = YogaAnalyzer._xy(landmarks, 28)
+        nose    = YogaAnalyzer._xy(landmarks, 0)
+
+        l_elbow_angle = YogaAnalyzer.calculate_angle(l_shldr, l_elbow, l_wrist)
+        r_elbow_angle = YogaAnalyzer.calculate_angle(r_shldr, r_elbow, r_wrist)
+        l_knee_angle  = YogaAnalyzer.calculate_angle(l_hip, l_knee, l_ankle)
+        r_knee_angle  = YogaAnalyzer.calculate_angle(r_hip, r_knee, r_ankle)
+        shoulder_center = YogaAnalyzer._avg(l_shldr, r_shldr)
+        hip_center      = YogaAnalyzer._avg(l_hip, r_hip)
+
+        if "Urdhva Hastasana" in current_pose:
+            if l_elbow_angle < 160:
+                corrections.append("Straighten your LEFT arm")
+                bad_joints.update([13, 15])
+            if r_elbow_angle < 160:
+                corrections.append("Straighten your RIGHT arm")
+                bad_joints.update([14, 16])
+            if l_wrist[1] > nose[1]:
+                corrections.append("Raise LEFT hand above your head")
+                bad_joints.add(15)
+            if r_wrist[1] > nose[1]:
+                corrections.append("Raise RIGHT hand above your head")
+                bad_joints.add(16)
+            if l_knee_angle < 165:
+                corrections.append("Straighten your LEFT leg")
+                bad_joints.update([25, 27])
+            if r_knee_angle < 165:
+                corrections.append("Straighten your RIGHT leg")
+                bad_joints.update([26, 28])
+
+        elif "Vrksasana" in current_pose:
+            if l_elbow_angle < 160:
+                corrections.append("Extend LEFT arm fully overhead")
+                bad_joints.update([13, 15])
+            if r_elbow_angle < 160:
+                corrections.append("Extend RIGHT arm fully overhead")
+                bad_joints.update([14, 16])
+
+        elif "Virabhadrasana" in current_pose:
+            if l_elbow_angle < 155:
+                corrections.append("Extend LEFT arm straight to the side")
+                bad_joints.update([13, 15])
+            if r_elbow_angle < 155:
+                corrections.append("Extend RIGHT arm straight to the side")
+                bad_joints.update([14, 16])
+            bent_knee = min(l_knee_angle, r_knee_angle)
+            if bent_knee > 110:
+                corrections.append("Bend your front knee deeper (aim ~90 deg)")
+                if l_knee_angle < r_knee_angle:
+                    bad_joints.add(25)
+                else:
+                    bad_joints.add(26)
+
+        elif "T Pose" in current_pose:
+            if l_elbow_angle < 155:
+                corrections.append("Extend LEFT arm fully horizontal")
+                bad_joints.update([13, 15])
+            if r_elbow_angle < 155:
+                corrections.append("Extend RIGHT arm fully horizontal")
+                bad_joints.update([14, 16])
+
+        elif "Slouching" in current_pose:
+            corrections.append("Lift your head — tuck your chin back")
+            corrections.append("Pull your shoulders back and down")
+            bad_joints.update([0, 11, 12])
+
+        # General torso alignment check (applies to all poses)
+        if abs(shoulder_center[0] - hip_center[0]) > 0.20:
+            corrections.append("Center your torso — reduce side lean")
+            bad_joints.update([11, 12, 23, 24])
+
+        if not corrections:
+            corrections.append("Great form! Hold the pose.")
+
+        return corrections, bad_joints
 
     @staticmethod
     def detect_posture(landmarks):
