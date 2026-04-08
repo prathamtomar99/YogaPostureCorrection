@@ -96,6 +96,7 @@ class YogaAnalyzer:
 
         return frame
 
+
     @staticmethod
     def get_corrections(landmarks, current_pose):
         """Compares actual joint angles vs ideal ranges and returns correction tips + bad joint indices."""
