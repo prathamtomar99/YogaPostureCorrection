@@ -7,6 +7,7 @@ This project detects **people**, tracks full-body **pose landmarks**, draws **jo
 - Real-time person detection from webcam (YOLO)
 - Full-body keypoint and skeleton visualization (MediaPipe)
 - Yoga posture classification (Tree, Raised Arms, Warrior II, T Pose, Neutral)
+- Optional voice coaching for spoken posture corrections
 - Video file input support
 - Bounding boxes + confidence labels
 - Live person count per frame
@@ -51,6 +52,24 @@ python src/main.py
 
 ```bash
 python src/main.py --source 0
+```
+
+### Voice correction coaching (enabled by default)
+
+```bash
+python src/main.py --source 0
+```
+
+### Tune voice repeat interval
+
+```bash
+python src/main.py --source 0 --voice --voice-interval 4
+```
+
+### Disable voice coaching explicitly
+
+```bash
+python src/main.py --source 0 --no-voice
 ```
 
 ### Video file input
