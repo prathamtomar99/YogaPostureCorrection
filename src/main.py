@@ -26,85 +26,218 @@ except ModuleNotFoundError as e:
     sys.exit(1)
 
 
+# class VoiceAssistant:
+#     def __init__(self, enabled=True, speak_interval_sec=3.0):
+#         self.enabled = enabled and pyttsx3 is not None
+#         self.speak_interval_sec = speak_interval_sec
+#         self.last_spoken_signature = ""
+#         self.last_spoken_at = 0.0
+#         self._queue = queue.Queue(maxsize=1)
+#         self._stop_event = threading.Event()
+#         self._worker = None
+
+#         if not self.enabled:
+#             if pyttsx3 is None:
+#                 print("Voice assistance is OFF (pyttsx3 not installed).")
+#             return
+
+#         self.engine = pyttsx3.init()
+#         self.engine.setProperty("rate", 165)
+#         self._worker = threading.Thread(target=self._speaker_loop, daemon=True)
+#         self._worker.start()
+#         print("Voice assistance is ON.")
+
+#     def _speaker_loop(self):
+#         while not self._stop_event.is_set():
+#             try:
+#                 texts = self._queue.get(timeout=0.2)
+#             except queue.Empty:
+#                 continue
+
+#             try:
+#                 for text in texts:
+#                     if text:
+#                         self.engine.say(text)
+#                         self.engine.runAndWait()
+#             except Exception as err:
+#                 print(f"Voice assistant error: {err}")
+
+#     def interrupt(self):
+#         if not self.enabled:
+#             return
+#         try:
+#             self.engine.stop()
+#         except Exception:
+#             pass
+
+#     def speak_lines_if_needed(self, lines, min_interval_sec=None, force=False):
+#         if not self.enabled:
+#             return
+
+#         now = time.time()
+#         interval = self.speak_interval_sec if min_interval_sec is None else min_interval_sec
+#         cleaned_lines = [line.replace("—", ", ").strip() for line in lines if line and line.strip()]
+#         if not cleaned_lines:
+#             return
+
+#         signature = " || ".join(cleaned_lines)
+
+#         # Avoid flooding with repeated feedback every frame.
+#         if (not force) and signature == self.last_spoken_signature and (now - self.last_spoken_at) < interval:
+#             return
+
+#         self.last_spoken_signature = signature
+#         self.last_spoken_at = now
+#         # Keep only the latest guidance so stale queued messages are not spoken.
+#         while not self._queue.empty():
+#             try:
+#                 self._queue.get_nowait()
+#             except queue.Empty:
+#                 break
+#         try:
+#             self._queue.put_nowait(cleaned_lines)
+#         except queue.Full:
+#             pass
+
+#     def stop(self):
+#         if not self.enabled:
+#             return
+#         self._stop_event.set()
+#         if self._worker is not None:
+#             self._worker.join(timeout=1.0)
+import asyncio
+import edge_tts
+import tempfile
+import os
+import threading
+import queue
+import time
+import subprocess
+import sys
+import ctypes
+
 class VoiceAssistant:
-    def __init__(self, enabled=True, speak_interval_sec=3.0):
-        self.enabled = enabled and pyttsx3 is not None
+    def __init__(self, enabled=True, speak_interval_sec=2.0, voice="en-IN-PrabhatNeural"):
+        self.enabled = enabled
         self.speak_interval_sec = speak_interval_sec
-        self.last_spoken_signature = ""
+        self.voice = voice
+
         self.last_spoken_at = 0.0
-        self._queue = queue.Queue(maxsize=1)
+
+        # Queue for latest message
+        self._queue = queue.Queue(maxsize=3)
         self._stop_event = threading.Event()
-        self._worker = None
-
-        if not self.enabled:
-            if pyttsx3 is None:
-                print("Voice assistance is OFF (pyttsx3 not installed).")
-            return
-
-        self.engine = pyttsx3.init()
-        self.engine.setProperty("rate", 165)
-        self._worker = threading.Thread(target=self._speaker_loop, daemon=True)
+        self._worker = threading.Thread(target=self._run_loop, daemon=True)
         self._worker.start()
-        print("Voice assistance is ON.")
 
-    def _speaker_loop(self):
+        print("Edge TTS Voice Assistant is ON." if self.enabled else "Voice OFF.")
+
+    # --------------------------
+    # Async speech function
+    # --------------------------
+    async def _speak_async(self, text):
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                filename = f.name
+
+            communicate = edge_tts.Communicate(text=text, voice=self.voice)
+            await communicate.save(filename)
+
+            # Play audio (cross-platform)
+            if sys.platform == "win32":
+                self._play_mp3_windows(filename)
+            elif sys.platform == "darwin":
+                subprocess.run(["afplay", filename])
+            else:
+                subprocess.run(["mpg123", "-q", filename])
+
+            os.remove(filename)
+
+        except Exception as e:
+            print(f"[Voice Error]: {e}")
+
+    def _play_mp3_windows(self, filename):
+        # Use WinMM MCI so playback blocks until completion, then safely delete temp file.
+        mci = ctypes.windll.winmm.mciSendStringW
+        alias = "tts_audio"
+
+        # Reset alias if it was left open from a prior failure.
+        mci(f"close {alias}", None, 0, None)
+
+        open_cmd = f'open "{filename}" type mpegvideo alias {alias}'
+        err = mci(open_cmd, None, 0, None)
+        if err != 0:
+            raise RuntimeError("Could not open audio file for playback")
+
+        try:
+            err = mci(f"play {alias} wait", None, 0, None)
+            if err != 0:
+                raise RuntimeError("Could not play audio file")
+        finally:
+            mci(f"close {alias}", None, 0, None)
+
+    # --------------------------
+    # Worker thread with event loop
+    # --------------------------
+    def _run_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         while not self._stop_event.is_set():
             try:
-                texts = self._queue.get(timeout=0.2)
+                text = self._queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            try:
-                for text in texts:
-                    if text:
-                        self.engine.say(text)
-                        self.engine.runAndWait()
-            except Exception as err:
-                print(f"Voice assistant error: {err}")
+            loop.run_until_complete(self._speak_async(text))
 
-    def interrupt(self):
-        if not self.enabled:
-            return
-        try:
-            self.engine.stop()
-        except Exception:
-            pass
-
-    def speak_lines_if_needed(self, lines, min_interval_sec=None, force=False):
-        if not self.enabled:
+    # --------------------------
+    # Public API
+    # --------------------------
+    def speak(self, text, force=False):
+        if not self.enabled or not text:
             return
 
         now = time.time()
-        interval = self.speak_interval_sec if min_interval_sec is None else min_interval_sec
-        cleaned_lines = [line.replace("—", ", ").strip() for line in lines if line and line.strip()]
-        if not cleaned_lines:
+
+        # throttle but allow repetition
+        if not force and (now - self.last_spoken_at) < self.speak_interval_sec:
             return
 
-        signature = " || ".join(cleaned_lines)
-
-        # Avoid flooding with repeated feedback every frame.
-        if (not force) and signature == self.last_spoken_signature and (now - self.last_spoken_at) < interval:
-            return
-
-        self.last_spoken_signature = signature
         self.last_spoken_at = now
-        # Keep only the latest guidance so stale queued messages are not spoken.
+
+        # Clear old messages (keep latest only)
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
-            except queue.Empty:
+            except:
                 break
+
         try:
-            self._queue.put_nowait(cleaned_lines)
+            self._queue.put_nowait(text)
         except queue.Full:
             pass
 
-    def stop(self):
-        if not self.enabled:
+    def speak_lines_if_needed(self, lines, min_interval_sec=None, force=False):
+        if not lines:
             return
+
+        cleaned_lines = [line.strip() for line in lines if line and line.strip()]
+        if not cleaned_lines:
+            return
+
+        original_interval = self.speak_interval_sec
+        if min_interval_sec is not None:
+            self.speak_interval_sec = min_interval_sec
+
+        try:
+            self.speak(cleaned_lines[0], force=force)
+        finally:
+            self.speak_interval_sec = original_interval
+
+    def stop(self):
         self._stop_event.set()
-        if self._worker is not None:
-            self._worker.join(timeout=1.0)
+        self._worker.join(timeout=1.0)
 
 
 def parse_args():
@@ -170,9 +303,11 @@ def main():
                 corrections, bad_joints = analyzer.get_corrections(landmarks, current_pose)
                 # Speak concise correction coaching, skip generic praise to reduce noise.
                 spoken_corrections = [tip for tip in corrections if "Great form" not in tip]
+                # if spoken_corrections:
+                    # voice_lines = [f"Current pose: {current_pose}"] + spoken_corrections
+                    # voice_assistant.speak_lines_if_needed(voice_lines, min_interval_sec=args.voice_interval)
                 if spoken_corrections:
-                    voice_lines = [f"Current pose: {current_pose}"] + spoken_corrections
-                    voice_assistant.speak_lines_if_needed(voice_lines, min_interval_sec=args.voice_interval)
+                    voice_assistant.speak(spoken_corrections[0])
 
                 pose_color = (0, 0, 255) if "Slouching" in current_pose else (0, 255, 0)
                 cv2.putText(annotated_frame, f"Pose: {current_pose}", (20, 80),
