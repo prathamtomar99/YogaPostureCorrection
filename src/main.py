@@ -108,12 +108,7 @@ except ModuleNotFoundError as e:
 import asyncio
 import edge_tts
 import tempfile
-import os
-import threading
-import queue
-import time
 import subprocess
-import sys
 import ctypes
 
 class VoiceAssistant:
@@ -123,6 +118,11 @@ class VoiceAssistant:
         self.voice = voice
 
         self.last_spoken_at = 0.0
+        self.last_requested_text = ""
+        self._interrupt_event = threading.Event()
+        self._active_process = None
+        self._mci_alias = "tts_audio"
+        self._is_playing = False
 
         # Queue for latest message
         self._queue = queue.Queue(maxsize=3)
@@ -136,7 +136,9 @@ class VoiceAssistant:
     # Async speech function
     # --------------------------
     async def _speak_async(self, text):
+        filename = None
         try:
+            self._is_playing = True
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
                 filename = f.name
 
@@ -147,34 +149,71 @@ class VoiceAssistant:
             if sys.platform == "win32":
                 self._play_mp3_windows(filename)
             elif sys.platform == "darwin":
-                subprocess.run(["afplay", filename])
+                self._play_with_process(["afplay", filename])
             else:
-                subprocess.run(["mpg123", "-q", filename])
-
-            os.remove(filename)
+                self._play_with_process(["mpg123", "-q", filename])
 
         except Exception as e:
             print(f"[Voice Error]: {e}")
+        finally:
+            self._is_playing = False
+            if filename and os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                except OSError:
+                    pass
+
+    def _play_with_process(self, command):
+        self._active_process = subprocess.Popen(command)
+        try:
+            while not self._stop_event.is_set() and not self._interrupt_event.is_set():
+                if self._active_process.poll() is not None:
+                    break
+                time.sleep(0.05)
+        finally:
+            if self._active_process and self._active_process.poll() is None:
+                self._active_process.terminate()
+                try:
+                    self._active_process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    self._active_process.kill()
+            self._active_process = None
+
+    def _mci_send(self, command, expect_response=False):
+        mci = ctypes.windll.winmm.mciSendStringW
+        if expect_response:
+            buffer = ctypes.create_unicode_buffer(128)
+            err = mci(command, buffer, 128, None)
+            return err, buffer.value
+        err = mci(command, None, 0, None)
+        return err, ""
 
     def _play_mp3_windows(self, filename):
-        # Use WinMM MCI so playback blocks until completion, then safely delete temp file.
-        mci = ctypes.windll.winmm.mciSendStringW
-        alias = "tts_audio"
+        alias = self._mci_alias
 
         # Reset alias if it was left open from a prior failure.
-        mci(f"close {alias}", None, 0, None)
+        self._mci_send(f"close {alias}")
 
         open_cmd = f'open "{filename}" type mpegvideo alias {alias}'
-        err = mci(open_cmd, None, 0, None)
+        err, _ = self._mci_send(open_cmd)
         if err != 0:
             raise RuntimeError("Could not open audio file for playback")
 
         try:
-            err = mci(f"play {alias} wait", None, 0, None)
+            err, _ = self._mci_send(f"play {alias}")
             if err != 0:
                 raise RuntimeError("Could not play audio file")
+
+            while not self._stop_event.is_set() and not self._interrupt_event.is_set():
+                err, mode = self._mci_send(f"status {alias} mode", expect_response=True)
+                if err != 0 or mode.lower() != "playing":
+                    break
+                time.sleep(0.05)
+
+            if self._interrupt_event.is_set() or self._stop_event.is_set():
+                self._mci_send(f"stop {alias}")
         finally:
-            mci(f"close {alias}", None, 0, None)
+            self._mci_send(f"close {alias}")
 
     # --------------------------
     # Worker thread with event loop
@@ -189,29 +228,62 @@ class VoiceAssistant:
             except queue.Empty:
                 continue
 
+            self._interrupt_event.clear()
             loop.run_until_complete(self._speak_async(text))
 
     # --------------------------
     # Public API
     # --------------------------
+    def interrupt(self, clear_queue=False):
+        if not self.enabled:
+            return
+
+        self._interrupt_event.set()
+
+        if sys.platform == "win32":
+            alias = self._mci_alias
+            self._mci_send(f"stop {alias}")
+            self._mci_send(f"close {alias}")
+        elif self._active_process and self._active_process.poll() is None:
+            self._active_process.terminate()
+
+        if clear_queue:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+
     def speak(self, text, force=False):
         if not self.enabled or not text:
             return
 
         now = time.time()
+        is_same_text = text == self.last_requested_text
 
-        # throttle but allow repetition
-        if not force and (now - self.last_spoken_at) < self.speak_interval_sec:
+        # Throttle repetitions, but allow immediate preemption if guidance changed.
+        if not force and is_same_text and (now - self.last_spoken_at) < self.speak_interval_sec:
             return
 
         self.last_spoken_at = now
+        self.last_requested_text = text
 
-        # Clear old messages (keep latest only)
-        while not self._queue.empty():
+        # Keep only one upcoming message. Do not preempt active speech unless forced.
+        if force:
+            self.interrupt(clear_queue=True)
+        else:
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+
+        if (not force) and self._is_playing:
             try:
-                self._queue.get_nowait()
-            except:
-                break
+                self._queue.put_nowait(text)
+            except queue.Full:
+                pass
+            return
 
         try:
             self._queue.put_nowait(text)
@@ -222,7 +294,7 @@ class VoiceAssistant:
         if not lines:
             return
 
-        cleaned_lines = [line.strip() for line in lines if line and line.strip()]
+        cleaned_lines = [line.replace("—", ", ").strip() for line in lines if line and line.strip()]
         if not cleaned_lines:
             return
 
@@ -231,11 +303,13 @@ class VoiceAssistant:
             self.speak_interval_sec = min_interval_sec
 
         try:
-            self.speak(cleaned_lines[0], force=force)
+            combined_text = ". ".join(cleaned_lines)
+            self.speak(combined_text, force=force)
         finally:
             self.speak_interval_sec = original_interval
 
     def stop(self):
+        self.interrupt(clear_queue=True)
         self._stop_event.set()
         self._worker.join(timeout=1.0)
 
@@ -247,6 +321,12 @@ def parse_args():
     parser.add_argument("--no-voice", action="store_true", help="Disable voice correction coaching")
     parser.add_argument("--voice-interval", type=float, default=3.0,
                         help="Minimum seconds between repeated spoken messages")
+    parser.add_argument(
+        "--voice-perspective",
+        choices=["mirror", "anatomical"],
+        default="mirror",
+        help="Use 'mirror' to swap left/right in spoken coaching for selfie view"
+    )
     return parser.parse_args()
 
 
@@ -254,6 +334,85 @@ def _resolve_video_source(source_arg):
     if isinstance(source_arg, str) and source_arg.isdigit():
         return int(source_arg)
     return source_arg
+
+
+def _clean_pose_name(current_pose):
+    if "(" in current_pose:
+        return current_pose.split("(", 1)[0].strip()
+    return current_pose.strip()
+
+
+def _swap_left_right_words(text):
+    # Swap side words for mirrored camera coaching while preserving sentence readability.
+    tmp = text.replace("LEFT", "__TMP_LEFT__").replace("RIGHT", "LEFT")
+    tmp = tmp.replace("__TMP_LEFT__", "RIGHT")
+    tmp = tmp.replace("left", "__tmp_left__").replace("right", "left")
+    return tmp.replace("__tmp_left__", "right")
+
+
+def _get_actionable_corrections(corrections, mirror_perspective=True, max_corrections=2):
+    cleaned = [c.strip() for c in corrections if c and c.strip()]
+    if mirror_perspective:
+        cleaned = [_swap_left_right_words(c) for c in cleaned]
+    actionable = [c for c in cleaned if "Great form" not in c]
+    return actionable[:max_corrections]
+
+
+class PoseVoiceCoach:
+    def __init__(self, correction_delay_sec=1.2, correction_repeat_sec=4.0):
+        self.correction_delay_sec = correction_delay_sec
+        self.correction_repeat_sec = correction_repeat_sec
+        self.active_pose = None
+        self.pose_started_at = 0.0
+        self.last_correction_signature = ""
+        self.last_correction_spoken_at = 0.0
+        self.had_actionable_corrections = False
+        self.good_form_announced = False
+
+    def reset(self):
+        self.active_pose = None
+        self.pose_started_at = 0.0
+        self.last_correction_signature = ""
+        self.last_correction_spoken_at = 0.0
+        self.had_actionable_corrections = False
+        self.good_form_announced = False
+
+    def next_message(self, current_pose, corrections, mirror_perspective=True):
+        now = time.time()
+        pose_name = _clean_pose_name(current_pose)
+
+        if pose_name != self.active_pose:
+            self.active_pose = pose_name
+            self.pose_started_at = now
+            self.last_correction_signature = ""
+            self.last_correction_spoken_at = 0.0
+            self.had_actionable_corrections = False
+            self.good_form_announced = False
+            return f"Pose switched to {pose_name}."
+
+        if (now - self.pose_started_at) < self.correction_delay_sec:
+            return None
+
+        selected = _get_actionable_corrections(corrections, mirror_perspective=mirror_perspective)
+        if not selected:
+            if self.had_actionable_corrections and not self.good_form_announced:
+                self.good_form_announced = True
+                return "Good form. Hold the pose."
+            return None
+
+        self.had_actionable_corrections = True
+        self.good_form_announced = False
+
+        signature = " || ".join(selected)
+        should_repeat = (now - self.last_correction_spoken_at) >= self.correction_repeat_sec
+        if signature == self.last_correction_signature and not should_repeat:
+            return None
+
+        self.last_correction_signature = signature
+        self.last_correction_spoken_at = now
+        if len(selected) == 1:
+            return f"Correction: {selected[0]}."
+        return f"Corrections: {selected[0]}. Also, {selected[1]}."
 
 def main():
     args = parse_args()
@@ -266,6 +425,7 @@ def main():
     analyzer = YogaAnalyzer()
     voice_enabled = not args.no_voice
     voice_assistant = VoiceAssistant(enabled=voice_enabled, speak_interval_sec=args.voice_interval)
+    pose_voice_coach = PoseVoiceCoach(correction_delay_sec=1.2, correction_repeat_sec=max(4.0, args.voice_interval))
 
     # Open Camera
     print("Connecting to Camera...")
@@ -301,13 +461,13 @@ def main():
             if landmarks and mp_person_count >= 1:
                 current_pose = analyzer.detect_posture(landmarks)
                 corrections, bad_joints = analyzer.get_corrections(landmarks, current_pose)
-                # Speak concise correction coaching, skip generic praise to reduce noise.
-                spoken_corrections = [tip for tip in corrections if "Great form" not in tip]
-                # if spoken_corrections:
-                    # voice_lines = [f"Current pose: {current_pose}"] + spoken_corrections
-                    # voice_assistant.speak_lines_if_needed(voice_lines, min_interval_sec=args.voice_interval)
-                if spoken_corrections:
-                    voice_assistant.speak(spoken_corrections[0])
+                voice_message = pose_voice_coach.next_message(
+                    current_pose,
+                    corrections,
+                    mirror_perspective=(args.voice_perspective == "mirror")
+                )
+                if voice_message:
+                    voice_assistant.speak_lines_if_needed([voice_message], min_interval_sec=args.voice_interval)
 
                 pose_color = (0, 0, 255) if "Slouching" in current_pose else (0, 255, 0)
                 cv2.putText(annotated_frame, f"Pose: {current_pose}", (20, 80),
@@ -322,14 +482,17 @@ def main():
             else:
                 cv2.putText(annotated_frame, "Detecting pose...", (20, 80), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                pose_voice_coach.reset()
                 voice_assistant.speak_lines_if_needed(["Detecting your pose. Please hold steady."], min_interval_sec=6.0)
         elif human_count > 1:
             cv2.putText(annotated_frame, "Too many people in frame!", (20, 80), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            pose_voice_coach.reset()
             voice_assistant.speak_lines_if_needed(["Only one person should be in frame."], min_interval_sec=6.0)
         else:
             cv2.putText(annotated_frame, "Waiting for person...", (20, 80), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            pose_voice_coach.reset()
             voice_assistant.speak_lines_if_needed(["Please step into the camera frame."], min_interval_sec=6.0)
 
         # Display
